@@ -1,41 +1,47 @@
 """
-app.py — Streamlit Personal Finance Command Center (single-file)
+app.py — Streamlit Personal Finance Command Center (easy version)
 
-Features:
-- Add/manage accounts (bank, savings, ISA, investments, pension)
-- Enter balances weekly/monthly (manual form or CSV upload)
-- Track savings rates/yields and their changes over time
-- Track expenses by category
-- Dashboard visuals: net worth trend, allocation, per-account growth
-- Forecast: cash via latest rates, investments via historical CAGR or custom rate
+What’s new vs your current one:
+- CSV import now matches account names case/space-insensitively and can auto‑create missing accounts
+- Manage accounts: rename, change type/currency, delete ALL data, or delete account
+- Reports (PDF): download a clean PDF with a table of accounts + allocation pie + net worth line
+- More stable database connection on Streamlit Cloud
 
-How to run locally (easiest):
-1) pip install -r requirements.txt
-2) streamlit run app.py
-
-How to deploy on Streamlit Cloud (simple):
-1) Push these files to a new GitHub repo
-2) Go to https://share.streamlit.io/ (Streamlit Community Cloud)
-3) New app → pick your repo and branch → Deploy
-(Heads-up: SQLite can reset on redeploys. Use the "Data Export" tab often.)
+How to deploy (no coding):
+1) Replace your GitHub repo files with these (overwrite app.py and requirements.txt).
+2) On Streamlit Cloud, click Redeploy (or New app if first time).
+3) In the app, go to Accounts → add/rename as needed, then Balances & Rates → import CSV.
 """
 import sqlite3
-from datetime import datetime, date
+from datetime import date
 from typing import Optional, Tuple
+from io import BytesIO
+import tempfile
 
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import streamlit as st
 
+# --------------------------
+# Settings
+# --------------------------
 DB_PATH = "finance.db"
+
+# Utility: normalize names for matching (case/space tolerant)
+def _norm(s: str) -> str:
+    return "" if s is None else " ".join(str(s).strip().lower().split())
 
 # --------------------------
 # DB Helpers
 # --------------------------
+@st.cache_resource
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # Shared connection; tuned pragmas reduce 'database is locked' issues
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA journal_mode = WAL;")
+    conn.execute("PRAGMA synchronous = NORMAL;")
     return conn
 
 def init_db():
@@ -53,7 +59,6 @@ def init_db():
         );
         """
     )
-
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS balances (
@@ -66,20 +71,18 @@ def init_db():
         );
         """
     )
-
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS rates (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             account_id INTEGER NOT NULL,
             date TEXT NOT NULL,
-            apr REAL NOT NULL,  -- 0.045 for 4.5%
+            apr REAL NOT NULL,
             FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
             UNIQUE(account_id, date)
         );
         """
     )
-
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS expenses (
@@ -87,35 +90,29 @@ def init_db():
             date TEXT NOT NULL,
             category TEXT NOT NULL,
             description TEXT,
-            amount REAL NOT NULL -- positive for spend
+            amount REAL NOT NULL
         );
         """
     )
-
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS contributions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             account_id INTEGER NOT NULL,
             date TEXT NOT NULL,
-            amount REAL NOT NULL, -- + deposit, - withdrawal
+            amount REAL NOT NULL,
             FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
         );
         """
     )
-
     conn.commit()
-    conn.close()
-
 
 # --------------------------
 # Data Access
 # --------------------------
-def fetch_df(query: str, params: Tuple = ()):
+def fetch_df(query: str, params: Tuple = ()): 
     conn = get_conn()
-    df = pd.read_sql_query(query, conn, params=params)
-    conn.close()
-    return df
+    return pd.read_sql_query(query, conn, params=params)
 
 def upsert_account(name: str, type_: str, currency: str = "GBP", target_allocation: Optional[float] = None):
     conn = get_conn()
@@ -129,7 +126,33 @@ def upsert_account(name: str, type_: str, currency: str = "GBP", target_allocati
         (name.strip(), type_.strip(), currency.strip(), target_allocation),
     )
     conn.commit()
-    conn.close()
+
+def update_account(account_id: int, name: str, type_: str, currency: str, target_allocation: Optional[float]):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE accounts SET name=?, type=?, currency=?, target_allocation=? WHERE id=?",
+        (name.strip(), type_.strip(), currency.strip(), target_allocation, account_id)
+    )
+    conn.commit()
+
+def delete_account_data(account_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM balances WHERE account_id=?", (account_id,))
+    cur.execute("DELETE FROM rates WHERE account_id=?", (account_id,))
+    cur.execute("DELETE FROM contributions WHERE account_id=?", (account_id,))
+    conn.commit()
+
+def delete_account(account_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+    conn.commit()
+
+def get_accounts_norm_map():
+    df = fetch_df("SELECT id, name FROM accounts")
+    return { _norm(n): i for i, n in zip(df['id'], df['name']) } if not df.empty else {}
 
 def add_balance(account_id: int, d: date, balance: float):
     conn = get_conn()
@@ -143,7 +166,6 @@ def add_balance(account_id: int, d: date, balance: float):
         (account_id, d.isoformat(), float(balance)),
     )
     conn.commit()
-    conn.close()
 
 def add_rate(account_id: int, d: date, apr: float):
     conn = get_conn()
@@ -157,7 +179,6 @@ def add_rate(account_id: int, d: date, apr: float):
         (account_id, d.isoformat(), float(apr)),
     )
     conn.commit()
-    conn.close()
 
 def add_expense(d: date, category: str, description: str, amount: float):
     conn = get_conn()
@@ -167,18 +188,6 @@ def add_expense(d: date, category: str, description: str, amount: float):
         (d.isoformat(), category.strip(), description.strip(), float(amount)),
     )
     conn.commit()
-    conn.close()
-
-def add_contribution(account_id: int, d: date, amount: float):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO contributions(account_id, date, amount) VALUES(?,?,?)",
-        (account_id, d.isoformat(), float(amount)),
-    )
-    conn.commit()
-    conn.close()
-
 
 # --------------------------
 # Analytics helpers
@@ -230,9 +239,7 @@ def historical_cagr(df: pd.DataFrame) -> Optional[float]:
     return (end_val / start_val) ** (1 / years) - 1
 
 def account_series(account_id: int) -> pd.DataFrame:
-    q = """
-    SELECT date, balance FROM balances WHERE account_id=? ORDER BY date
-    """
+    q = "SELECT date, balance FROM balances WHERE account_id=? ORDER BY date"
     df = fetch_df(q, (account_id,))
     if not df.empty:
         df['date'] = pd.to_datetime(df['date'])
@@ -240,9 +247,7 @@ def account_series(account_id: int) -> pd.DataFrame:
     return df
 
 def latest_rate_for_account(account_id: int) -> Optional[float]:
-    q = """
-    SELECT apr FROM rates WHERE account_id=? ORDER BY date DESC LIMIT 1
-    """
+    q = "SELECT apr FROM rates WHERE account_id=? ORDER BY date DESC LIMIT 1"
     df = fetch_df(q, (account_id,))
     if df.empty:
         return None
@@ -278,7 +283,6 @@ def forecast_investment(series: pd.DataFrame, months: int = 12, override_rate: O
     dates = pd.date_range(date.today(), periods=months, freq='M')
     return pd.DataFrame({'date': dates, 'value': vals})
 
-
 # --------------------------
 # UI
 # --------------------------
@@ -292,6 +296,7 @@ def sidebar_nav() -> str:
             "Balances & Rates",
             "Expenses",
             "Forecast",
+            "Reports (PDF)",
             "Data Export"
         ],
     )
@@ -342,8 +347,9 @@ def page_dashboard():
 
 def page_accounts():
     st.title("Accounts")
-    st.caption("Add bank, savings, ISA, investment, or pension accounts.")
+    st.caption("Add, edit, or delete accounts. Rename to fix CSV mismatches.")
 
+    # Add / update
     with st.form("add_acct"):
         name = st.text_input("Account name")
         type_ = st.selectbox("Type", ['bank', 'savings', 'isa', 'investment', 'pension'])
@@ -355,13 +361,39 @@ def page_accounts():
             st.success("Saved.")
 
     st.divider()
-    st.subheader("Existing Accounts")
+    st.subheader("Manage Existing Accounts")
     df = fetch_df("SELECT id, name, type, currency, target_allocation FROM accounts ORDER BY name")
     if df.empty:
         st.info("No accounts yet.")
-    else:
-        df['target_allocation'] = (df['target_allocation'] * 100).round(2)
-        st.dataframe(df, use_container_width=True)
+        return
+
+    edit_id = st.selectbox(
+        "Choose account to edit",
+        options=df['id'],
+        format_func=lambda i: df.loc[df['id']==i, 'name'].values[0]
+    )
+    row = df[df['id']==edit_id].iloc[0]
+    col1, col2 = st.columns(2)
+
+    with col1:
+        new_name = st.text_input("Rename", value=row['name'])
+        new_type = st.selectbox("Type", ['bank','savings','isa','investment','pension'],
+                                index=['bank','savings','isa','investment','pension'].index(row['type']))
+        new_curr = st.selectbox("Currency", ['GBP','USD','EUR'],
+                                index=['GBP','USD','EUR'].index(row['currency']))
+        new_alloc = st.number_input("Target allocation %", min_value=0.0, max_value=100.0,
+                                    value=float((row['target_allocation'] or 0)*100))
+        if st.button("Save changes"):
+            update_account(int(edit_id), new_name, new_type, new_curr, (new_alloc/100.0) if new_alloc else None)
+            st.success("Updated. (If the table doesn't refresh, click Rerun in Streamlit.)")
+
+    with col2:
+        if st.button("Delete ALL data for this account"):
+            delete_account_data(int(edit_id))
+            st.warning("All balances/rates for this account deleted.")
+        if st.button("Delete account entirely"):
+            delete_account(int(edit_id))
+            st.error("Account deleted. (Switch tabs or rerun to refresh.)")
 
 def page_balances_rates():
     st.title("Balances & Rates")
@@ -398,40 +430,44 @@ def page_balances_rates():
 
     st.divider()
     st.subheader("Bulk CSV Upload")
-    st.caption("Upload balances with columns: account,date,balance and (optional) rate. Dates as YYYY-MM-DD.")
+    st.caption("Upload balances with columns: account,date,balance and (optional) rate. Names are matched case/space‑insensitively; missing accounts can be auto‑created.")
+    create_missing = st.checkbox("Auto-create missing accounts as 'savings'", value=True)
+
     up = st.file_uploader("CSV file", type=['csv'])
     if up:
         try:
-            df = pd.read_csv(up)
+            dfcsv = pd.read_csv(up)
             needed = {'account','date','balance'}
-            lower = {c.lower(): c for c in df.columns}
-            if not needed.issubset(set(lower.keys())):
+            cols = {c.lower(): c for c in dfcsv.columns}
+            if not needed.issubset(set(cols.keys())):
                 st.error("CSV must include account,date,balance")
             else:
-                for _, r in df.iterrows():
-                    acc_name = r[lower['account']]
-                    acc_row = fetch_df("SELECT id FROM accounts WHERE name=?", (acc_name,))
-                    if acc_row.empty:
-                        st.warning(f"Account '{acc_name}' not found. Skipping row.")
-                        continue
-                    acc_id = int(acc_row['id'].iloc[0])
-                    d = pd.to_datetime(r[lower['date']]).date()
-                    bal = float(r[lower['balance']])
-                    add_balance(acc_id, d, bal)
-                    if 'rate' in lower and not pd.isna(r[lower['rate']]):
-                        apr = float(r[lower['rate']])/100.0 if r[lower['rate']] > 1.0 else float(r[lower['rate']])
-                        add_rate(acc_id, d, apr)
-                st.success("CSV processed.")
+                norm_map = get_accounts_norm_map()
+                created = updated = skipped = 0
+                for _, r in dfcsv.iterrows():
+                    acc_name_raw = str(r[cols['account']])
+                    acc_norm = _norm(acc_name_raw)
+                    acc_id = norm_map.get(acc_norm)
+                    if acc_id is None:
+                        if create_missing and acc_name_raw.strip():
+                            upsert_account(acc_name_raw, 'savings', 'GBP', None)
+                            norm_map = get_accounts_norm_map()
+                            acc_id = norm_map.get(acc_norm)
+                            created += 1
+                        else:
+                            skipped += 1
+                            continue
+                    d = pd.to_datetime(r[cols['date']]).date()
+                    bal = float(r[cols['balance']])
+                    add_balance(int(acc_id), d, bal)
+                    updated += 1
+                    if 'rate' in cols and not pd.isna(r[cols['rate']]):
+                        rv = float(r[cols['rate']])
+                        apr = rv/100.0 if rv > 1.0 else rv
+                        add_rate(int(acc_id), d, apr)
+                st.success(f"CSV processed. Rows added/updated: {updated}. Accounts created: {created}. Skipped: {skipped}.")
         except Exception as e:
             st.exception(e)
-
-    st.divider()
-    st.subheader("Recent Balances")
-    lb = latest_balances_df()
-    if lb.empty:
-        st.info("No data yet.")
-    else:
-        st.dataframe(lb, use_container_width=True)
 
 def page_expenses():
     st.title("Expenses")
@@ -501,6 +537,73 @@ def page_forecast():
     fig2 = px.line(totals, x='date', y='value', labels={'value':'£'})
     st.plotly_chart(fig2, use_container_width=True)
 
+def page_reports():
+    st.title("Reports (PDF)")
+    st.caption("Download a clean PDF snapshot of your finances (balances + charts).")
+
+    lb = latest_balances_df()
+    if lb.empty:
+        st.info("Add some balances first.")
+        return
+
+    # Build charts and export as PNG with kaleido
+    imgs = {}
+    nw = net_worth_series()
+    if not nw.empty:
+        fig_nw = px.line(nw, x='date', y='net_worth', title='Net Worth Over Time', labels={'net_worth':'£'})
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            fig_nw.write_image(tmp.name, scale=2)
+            imgs['networth'] = tmp.name
+
+    alloc = allocation_snapshot()
+    if not alloc.empty:
+        fig_alloc = px.pie(alloc, names='type', values='last_balance', hole=0.4, title='Allocation Snapshot')
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            fig_alloc.write_image(tmp.name, scale=2)
+            imgs['alloc'] = tmp.name
+
+    # Create PDF with reportlab
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen.canvas import Canvas
+    from reportlab.lib.units import cm
+
+    buf = BytesIO()
+    c = Canvas(buf, pagesize=A4)
+    width, height = A4
+
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(2*cm, height - 2*cm, "Personal Finance Snapshot")
+    c.setFont("Helvetica", 10)
+    c.drawString(2*cm, height - 2.6*cm, "Generated by your Streamlit app")
+
+    y = height - 3.2*cm
+
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(2*cm, y, "Latest Balances"); y -= 0.6*cm
+    c.setFont("Helvetica", 10)
+    for _, r in lb.fillna(0).iterrows():
+        line = f"{r['name']}  ({str(r['type']).upper()})   £{float(r['last_balance'] or 0):,.0f}"
+        c.drawString(2*cm, y, line)
+        y -= 0.5*cm
+        if y < 4*cm:
+            c.showPage(); y = height - 3*cm
+
+    if 'alloc' in imgs:
+        c.showPage()
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(2*cm, height - 2.5*cm, "Charts")
+        c.drawImage(imgs['alloc'], 2*cm, height - 15*cm, width=12*cm, preserveAspectRatio=True, mask='auto')
+    if 'networth' in imgs:
+        c.drawImage(imgs['networth'], 2*cm, height - 27*cm, width=12*cm, preserveAspectRatio=True, mask='auto')
+
+    c.showPage()
+    c.save()
+    pdf_bytes = buf.getvalue()
+    buf.close()
+
+    st.download_button("Download PDF report", data=pdf_bytes, file_name="finance_report.pdf", mime="application/pdf")
+    st.success("PDF generated.")
+
 def page_export():
     st.title("Data Export")
     st.caption("Download CSVs for backup or offline analysis.")
@@ -510,7 +613,6 @@ def page_export():
     accounts = pd.read_sql_query("SELECT * FROM accounts", conn)
     rates = pd.read_sql_query("SELECT * FROM rates", conn)
     expenses = pd.read_sql_query("SELECT * FROM expenses", conn)
-    conn.close()
 
     for name, df in {
         'accounts.csv': accounts,
@@ -528,13 +630,10 @@ def page_export():
 # --------------------------
 # Main
 # --------------------------
-
-def main():
+def sidebar_and_route():
     st.set_page_config(page_title="Finance Command Center", layout="wide")
     init_db()
-
     page = sidebar_nav()
-
     if page == "Dashboard":
         page_dashboard()
     elif page == "Accounts":
@@ -545,8 +644,10 @@ def main():
         page_expenses()
     elif page == "Forecast":
         page_forecast()
+    elif page == "Reports (PDF)":
+        page_reports()
     elif page == "Data Export":
         page_export()
 
 if __name__ == "__main__":
-    main()
+    sidebar_and_route()
